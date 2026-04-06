@@ -52,7 +52,102 @@ Requirements: **.NET 10**, **SkiaSharp 3.116.1**
 
 ## Usage
 
-### Step 1 — Preprocess (before inference)
+### Complete Example — 1920×1080 Image
+
+This example shows the full pipeline for a high-resolution photo. **You never resize manually** — the library handles the 312×312 model input internally and maps everything back to original pixel space automatically.
+
+```
+1920×1080 JPEG
+      │
+      │  ImagePreprocessor.Prepare()
+      │  → scales to 312×312 internally
+      │  → remembers 1920 / 1080 via out params
+      ▼
+float[291888]  (= 1×3×312×312, NCHW)
+      │
+      │  ONNX Runtime  (your code)
+      ▼
+dets   float[400]      (= 100×4)
+labels float[200]      (= 100×2)
+masks  float[608400]   (= 100×78×78)
+      │
+      │  PostProcessor.Process(origW: 1920, origH: 1080)
+      │  → converts cxcywh → pixel xyxy  (×1920 / ×1080)
+      │  → upscales each 78×78 mask → 1920×1080
+      ▼
+DetectionResult
+  ├── Mask        byte[2073600]   (= 1920×1080, 0/255)
+  ├── BoundingBox SKRectI         in 1920×1080 pixel space
+  └── GetCorners(4) SKPoint[]     in 1920×1080 pixel space
+```
+
+```csharp
+using RfDetr.Preprocessing;
+using Microsoft.ML.OnnxRuntime;
+
+// ── 1. Preprocess ────────────────────────────────────────────────────────
+byte[] imageBytes = File.ReadAllBytes("photo_1920x1080.jpg"); // JPEG or PNG
+
+float[] tensor = ImagePreprocessor.Prepare(imageBytes, out int origW, out int origH);
+// origW = 1920, origH = 1080  (read from the actual image, no hardcoding needed)
+// tensor has 1×3×312×312 = 291 888 floats — ready for the model
+
+// ── 2. Inference ─────────────────────────────────────────────────────────
+using var session = new InferenceSession("model_int8.onnx");
+using var inputTensor = OrtValue.CreateTensorValueFromMemory(
+    tensor, new long[] { 1, 3, 312, 312 });
+
+var outputs = session.Run(
+    new RunOptions(),
+    inputNames:  ["input"],
+    inputValues: [inputTensor],
+    outputNames: ["dets", "labels", "masks"]);
+
+float[] dets   = outputs[0].GetTensorDataAsSpan<float>().ToArray(); // 100×4
+float[] labels = outputs[1].GetTensorDataAsSpan<float>().ToArray(); // 100×2
+float[] masks  = outputs[2].GetTensorDataAsSpan<float>().ToArray(); // 100×78×78
+
+// ── 3. Postprocess ────────────────────────────────────────────────────────
+// Pass origW/origH — the library maps everything back to 1920×1080 for you
+var results = PostProcessor.Process(dets, labels, masks, origW, origH, threshold: 0.5f);
+
+if (results.Count == 0)
+{
+    Console.WriteLine("No document detected.");
+    return;
+}
+
+DetectionResult best = results[0]; // sorted by score descending
+
+// ── Mask in original resolution ──────────────────────────────────────────
+byte[] mask = best.Mask;
+// Length = 1920 × 1080 = 2 073 600 bytes
+// 255 = document pixel, 0 = background
+// Access pixel at (x, y):  mask[y * origW + x]
+
+// ── 4 corners in original pixel space ────────────────────────────────────
+SKPoint[] corners = best.GetCorners(4, CornerMethod.ContourApproximation);
+// corners[0..3] are SKPoint with X/Y in [0, 1920] / [0, 1080]
+// Typical order returned by contour tracing (clockwise from top-left)
+
+Console.WriteLine($"Score:   {best.Score:P1}");
+Console.WriteLine($"BBox:    {best.BoundingBox}");  // e.g. {240,135,1680,945}
+Console.WriteLine($"Corners: {string.Join(", ", corners.Select(p => $"({p.X:F0},{p.Y:F0})"))}");
+
+// ── Use corners for perspective correction ────────────────────────────────
+// corners[] can be passed directly to a homography/warp function
+// e.g. SkiaSharp SKMatrix.CreatePerspective or OpenCV warpPerspective
+```
+
+> **Why does this work without manual rescaling?**
+> `ImagePreprocessor.Prepare()` resizes to 312×312 internally but returns the original dimensions.
+> `PostProcessor` uses those dimensions to:
+> - multiply normalized bbox coordinates by `origW`/`origH`
+> - bilinearly upscale each 78×78 logit mask to `origW × origH` before binarizing
+
+---
+
+### Minimal Usage (quick start)
 
 ```csharp
 using RfDetr.Preprocessing;
@@ -60,7 +155,6 @@ using RfDetr.Preprocessing;
 byte[] imageBytes = File.ReadAllBytes("photo.jpg"); // or from camera stream
 
 float[] tensor = ImagePreprocessor.Prepare(imageBytes, out int origW, out int origH);
-// tensor shape: [1, 3, 312, 312] — NCHW, float32, values in [0, 1]
 // Pass as ONNX input named "input"
 ```
 
@@ -81,25 +175,13 @@ float[] masks  = outputs[2].GetTensorDataAsSpan<float>().ToArray(); // [100 * 78
 ### Step 3 — Postprocess (after inference)
 
 ```csharp
-var results = PostProcessor.Process(
-    dets, labels, masks,
-    origW, origH,
-    threshold: 0.5f);   // confidence threshold
+var results = PostProcessor.Process(dets, labels, masks, origW, origH, threshold: 0.5f);
 
-foreach (var det in results)
-{
-    Console.WriteLine($"Score: {det.Score:P1}");
-    Console.WriteLine($"BBox:  {det.BoundingBox}");          // pixel coords
+DetectionResult best = results[0];
 
-    // 4 document corners (for perspective correction)
-    SKPoint[] corners = det.GetCorners(4, CornerMethod.ContourApproximation);
-
-    // Or normalized for drawing overlays
-    SKPoint[] normCorners = det.GetNormalizedCorners(4);
-
-    // Binary mask (0 or 255 per pixel, row-major, original image size)
-    byte[] mask = det.Mask; // length = origW * origH
-}
+SKPoint[] corners = best.GetCorners(4, CornerMethod.ContourApproximation); // pixel coords
+byte[]    mask    = best.Mask;   // length = origW * origH, values 0 or 255
+SKRectI   bbox    = best.BoundingBox;
 ```
 
 ---
